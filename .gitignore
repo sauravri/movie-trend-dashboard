@@ -1,0 +1,13 @@
+# Python cache files
+__pycache__/
+*.pyc
+
+# Environment files
+.env
+
+# Data files
+data/raw/
+data/processed/
+
+# Config
+config/.env
