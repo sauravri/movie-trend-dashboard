@@ -2,7 +2,17 @@ import mysql.connector
 from dotenv import load_dotenv
 import os
 import requests
+import logging
 
+from utils import (
+    fallback_int,
+    fallback_float,
+    fallback_year,
+    fallback_str,
+    fallback_genre_ids,
+)
+
+# =================================================================================================
 load_dotenv()
 
 DB_HOST = os.getenv("DB_HOST")
@@ -24,6 +34,7 @@ def connect():
     )
 
 
+# =================================================================================================
 def create_table():
     conn = connect()
     cursor = conn.cursor()
@@ -46,8 +57,7 @@ def create_table():
             title VARCHAR(255),
             release_year INTEGER,
             vote_average FLOAT,
-            popularity FLOAT,
-            box_office INTEGER
+            popularity FLOAT
         )
     """
     )
@@ -70,40 +80,48 @@ def create_table():
     conn.close()
 
 
-def insert_movie(title, release_year, vote_average, popularity, box_office, genre_ids):
-    conn = connect()
-    cursor = conn.cursor()
-
-    # Insert movie first
+def movie_exists(cursor, title, release_year):
+    """Check if a movie already exists in the db."""
     cursor.execute(
-        """
-        INSERT INTO movies (title, release_year, vote_average, popularity, box_office)
-        VALUES (%s, %s, %s, %s, %s)
-        """,
-        (title, release_year, vote_average, popularity, box_office),
+        "SELECT id FROM movies WHERE title = %s AND release_year = %s LIMIT 1",
+        (title, release_year),
     )
-    conn.commit()
-    movie_id = cursor.lastrowid
+    return cursor.fetchone()
 
-    # Insert genres
-    for genre_id in genre_ids:
-        # Check if genre already exists
-        response = requests.get(
-            f"https://api.themoviedb.org/3/genre/movie/list?api_key={TMDB_API_KEY}"
+
+def insert_movie(
+    conn, cursor, title, release_year, vote_average, popularity, genre_ids
+):
+    """Insert movie with genres into the database."""
+    try:
+        # Insert movie first
+        cursor.execute(
+            """
+            INSERT INTO movies (title, release_year, vote_average, popularity)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (title, release_year, vote_average, popularity),
         )
-        genres = response.json().get("genres", [])
-        for g in genres:
-            if g["id"] == genre_id:
-                genre_name = g["name"]
+        movie_id = cursor.lastrowid
 
-                # Insert or reuse genre
+        # Insert genres and link them to the movie
+        response = requests.get(
+            f"https://api.themoviedb.org/3/genre/movie/list?api_key={TMDB_API_KEY}",
+            timeout=10,
+        )
+        response.raise_for_status()
+        genres = response.json().get("genres", [])
+        genres_map = {g["id"]: g["name"] for g in genres}
+
+        for genre_id in genre_ids:
+            genre_name = genres_map.get(genre_id)
+            if genre_name:
                 try:
                     cursor.execute(
                         "INSERT IGNORE INTO genres (name) VALUES (%s)", (genre_name,)
                     )
-                    conn.commit()
                 except mysql.connector.Error as e:
-                    print("Error inserting genre.", e)
+                    logging.error(f"Error inserting genre {genre_name}. Exception: {e}")
 
                 # Retrieve its id
                 cursor.execute(
@@ -117,43 +135,123 @@ def insert_movie(title, release_year, vote_average, popularity, box_office, genr
                     "INSERT INTO movie_genres (movie_id, genre_id) VALUES (%s, %s)",
                     (movie_id, genre_db_id),
                 )
-                conn.commit()
 
-                break
-
-    cursor.close()
-    conn.close()
+        conn.commit()
+        logging.info(f"Movie {title} successfully added.")
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Error inserting movie {title}. Exception: {e}")
 
 
 def fetch_movie(id=None, page=None):
-    """Fetch popular movies from TMDB API."""
-    if id:
-        response = requests.get(
-            f"https://api.themoviedb.org/3/movie/{id}?api_key={TMDB_API_KEY}"
-        )
-        return response.json()
-    elif page:
-        response = requests.get(
-            f"https://api.themoviedb.org/3/movie/popular?api_key={TMDB_API_KEY}&page={page}"
-        )
-        return response.json()
-
-
-def main():
-    create_table()
-    for page in range(1, 5):  # 4 pages = 80 popular movies
-        data = fetch_movie(page=page)
-        for movie in data["results"]:
-            insert_movie(
-                movie["title"],
-                int(movie["release_date"].split("-")[0]),
-                movie["vote_average"],
-                movie["popularity"],
-                0,  # box_office is not available here
-                movie["genre_ids"],
+    """Fetch popular movies or by id from TMDB API with error handling."""
+    try:
+        if id:
+            response = requests.get(
+                f"https://api.themoviedb.org/3/movie/{id}?api_key={TMDB_API_KEY}",
+                timeout=10,
             )
-    
-    print("Data is ready!")
+        elif page:
+            response = requests.get(
+                f"https://api.themoviedb.org/3/movie/popular?api_key={TMDB_API_KEY}&page={page}",
+                timeout=10,
+            )
+        if response.status_code == 400:
+            logging.error("Received 400. Breaking pagination.")
+            return None
+
+        response.raise_for_status()
+        return response.json()
+
+    except requests.RequestException as e:
+        logging.error(f"Error retrieving from TMDB API: {e}")
+        return {}  # fallback to empty
+
+
+# =================================================================================================
+def get_safe_field(data, field_name, fallback=None, transform=None):
+    """Safely extract a field from a dictionary with fallback and transformation if needed."""
+    value = data.get(field_name)
+    if not value or value == "" or value is None:
+        return fallback
+    if transform:
+        try:
+            return transform(value)
+        except (ValueError, TypeError):
+            return fallback
+    return value
+
+
+# ============================================================================================
+def main():
+    """Main pipeline to fetch popular movies and insert into db with genres."""
+    create_table()
+
+    conn = connect()
+    conn.autocommit = False
+    cursor = conn.cursor()
+
+    try:
+        page = 1
+        total_pages = 1
+
+        while page <= total_pages:
+            logging.info(f"Fetching page {page}.")
+            data = fetch_movie(page=page)
+
+            if not data:
+                logging.error("No data or pagination halted.")
+                break
+
+            total_pages = data.get("total_pages", 1)
+
+            for movie in data.get("results", []):
+
+                title = movie.get("title") or "Unknown Title"
+
+                release_year = get_safe_field(
+                    movie,
+                    "release_date",
+                    fallback=None,
+                    transform=lambda x: int(x.split("-")[0]),
+                )
+
+                vote_average = get_safe_field(
+                    movie, "vote_average", fallback=0.0, transform=float
+                )
+
+                popularity = get_safe_field(
+                    movie, "popularity", fallback=0.0, transform=float
+                )
+
+                genre_ids = movie.get("genre_ids") or []
+
+                if movie_exists(cursor, title, release_year):
+                    logging.info(f"Movie {title} already exists. Skipping.")
+                    continue
+
+                insert_movie(
+                    conn,
+                    cursor,
+                    title,
+                    release_year,
+                    vote_average,
+                    popularity,
+                    genre_ids,
+                )
+
+            page += 1
+
+        logging.info("Data is ready.")
+        print("Data is ready!")
+
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Error during main. Exception: {e}")
+
+    finally:
+        cursor.close()
+        conn.close()
 
 
 if __name__ == "__main__":
